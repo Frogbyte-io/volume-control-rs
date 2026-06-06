@@ -5,8 +5,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::AudioController;
-
 const IGNORE_AFTER_TARGET_UPDATE: Duration = Duration::from_millis(250);
 const IGNORE_AFTER_SET_VOLUME: Duration = Duration::from_millis(250);
 
@@ -76,6 +74,7 @@ impl VolumeMonitor {
             },
         }
     }
+
     pub fn is_polling_active(&self) -> bool {
         self.state.polling_active.load(Ordering::Relaxed)
     }
@@ -95,14 +94,11 @@ impl VolumeMonitor {
         mapped.extend(session_names);
     }
 
-    pub fn unregister_all_callbacks(
-        &mut self,
-        _controller: &mut AudioController,
-    ) -> windows::core::Result<()> {
+    pub fn unregister_all_callbacks(&mut self) -> Result<(), String> {
         Ok(())
     }
 
-    pub fn update_expected_volume(&self, session_name: &str, volume: f32) -> windows::core::Result<()> {
+    pub fn update_expected_volume(&self, session_name: &str, volume: f32) {
         let clamped = volume.clamp(0.0, 1.0);
         self.state
             .expected_volumes
@@ -114,7 +110,6 @@ impl VolumeMonitor {
             .lock()
             .unwrap()
             .insert(session_name.to_string(), Instant::now());
-        Ok(())
     }
 
     pub fn get_expected_volume(&self, session_name: &str) -> Option<f32> {
@@ -169,7 +164,7 @@ mod tests {
     fn ignore_after_target_update() {
         let monitor = VolumeMonitor::new();
         monitor.set_mapped_sessions(vec!["app".to_string()]);
-        monitor.update_expected_volume("app", 0.5).unwrap();
+        monitor.update_expected_volume("app", 0.5);
         assert!(monitor.should_ignore_restore("app"));
     }
 
@@ -177,8 +172,8 @@ mod tests {
     fn respects_mapped_sessions_allowlist() {
         let monitor = VolumeMonitor::new();
         monitor.set_mapped_sessions(vec!["allowed".to_string()]);
-        monitor.update_expected_volume("allowed", 0.5).unwrap();
-        monitor.update_expected_volume("blocked", 0.2).unwrap();
+        monitor.update_expected_volume("allowed", 0.5);
+        monitor.update_expected_volume("blocked", 0.2);
 
         assert_eq!(monitor.get_expected_volume("allowed"), Some(0.5));
         assert_eq!(monitor.get_expected_volume("blocked"), None);
@@ -188,7 +183,7 @@ mod tests {
     fn unmapped_token_allows_all_expected() {
         let monitor = VolumeMonitor::new();
         monitor.set_mapped_sessions(vec!["unmapped".to_string()]);
-        monitor.update_expected_volume("anything", 0.75).unwrap();
+        monitor.update_expected_volume("anything", 0.75);
         assert_eq!(monitor.get_expected_volume("anything"), Some(0.75));
     }
 }
