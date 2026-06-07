@@ -16,7 +16,7 @@ mod session;
 use session::{LinuxApplicationSession, LinuxDeviceSession};
 
 pub struct AudioController {
-    mainloop: Arc<Mainloop>,
+    mainloop: Arc<Mutex<Mainloop>>,
     context: Arc<Mutex<Context>>,
     sessions: Vec<Box<dyn Session>>,
     default_output_index: Option<u32>,
@@ -43,6 +43,19 @@ fn fire_signal(signal: &DoneSignal) {
     cvar.notify_one();
 }
 
+/// Acquire the PulseAudio threaded-mainloop lock. Returns the std mutex guard
+/// that owns the `&mut Mainloop`; pass it to [`pa_unlock`] to release the PA
+/// lock (and then the std mutex) once the introspect operation is submitted.
+fn pa_lock(mainloop: &Arc<Mutex<Mainloop>>) -> std::sync::MutexGuard<'_, Mainloop> {
+    let mut guard = mainloop.lock().unwrap();
+    guard.lock();
+    guard
+}
+
+fn pa_unlock(mut guard: std::sync::MutexGuard<'_, Mainloop>) {
+    guard.unlock();
+}
+
 fn avg_volume_to_linear(cv: &pulse::volume::ChannelVolumes) -> f32 {
     cv.avg().0 as f64 as f32 / Volume::NORMAL.0 as f32
 }
@@ -56,54 +69,50 @@ fn get_process_name_from_proc(pid_str: &str) -> Option<String> {
 
 impl AudioController {
     pub fn init(_coinit_mode: Option<CoinitMode>) -> Self {
-        let mainloop = Mainloop::new().unwrap_or_else(|| {
+        let mut mainloop = Mainloop::new().unwrap_or_else(|| {
             eprintln!("ERROR: Failed to create PulseAudio threaded mainloop");
             error!("ERROR: Failed to create PulseAudio threaded mainloop");
             exit(1);
         });
 
-        let context = Context::new(&mainloop, "volume-control-rs").unwrap_or_else(|| {
+        let mut context = Context::new(&mainloop, "volume-control-rs").unwrap_or_else(|| {
             eprintln!("ERROR: Failed to create PulseAudio context");
             error!("ERROR: Failed to create PulseAudio context");
             exit(1);
         });
 
-        mainloop.lock();
-
         context
             .connect(None, ContextFlagSet::NOFLAGS, None)
             .unwrap_or_else(|err| {
-                mainloop.unlock();
                 eprintln!("ERROR: Failed to connect to PulseAudio: {:?}", err);
                 error!("ERROR: Failed to connect to PulseAudio: {:?}", err);
                 exit(1);
             });
 
         mainloop.start().unwrap_or_else(|err| {
-            mainloop.unlock();
             eprintln!("ERROR: Failed to start PulseAudio mainloop: {:?}", err);
             error!("ERROR: Failed to start PulseAudio mainloop: {:?}", err);
             exit(1);
         });
 
-        // Wait until context is Ready
+        // Wait until the context is ready, polling its state under the mainloop lock.
         loop {
-            match context.get_state() {
+            mainloop.lock();
+            let state = context.get_state();
+            mainloop.unlock();
+            match state {
                 ContextState::Ready => break,
                 ContextState::Failed | ContextState::Terminated => {
-                    mainloop.unlock();
                     eprintln!("ERROR: PulseAudio context failed to connect");
                     error!("ERROR: PulseAudio context failed to connect");
                     exit(1);
                 }
-                _ => mainloop.wait(),
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         }
 
-        mainloop.unlock();
-
         Self {
-            mainloop: Arc::new(mainloop),
+            mainloop: Arc::new(Mutex::new(mainloop)),
             context: Arc::new(Mutex::new(context)),
             sessions: vec![],
             default_output_index: None,
@@ -133,7 +142,7 @@ impl AudioController {
             let result: Arc<Mutex<Option<SinkResult>>> = Arc::new(Mutex::new(None));
             let result_cb = result.clone();
 
-            mainloop.lock();
+            let pa_guard = pa_lock(&mainloop);
             context.lock().unwrap().introspect().get_sink_info_by_name(
                 "@DEFAULT_SINK@",
                 move |list| match list {
@@ -158,10 +167,11 @@ impl AudioController {
                     }
                 },
             );
-            mainloop.unlock();
+            pa_unlock(pa_guard);
             wait_for_signal(&signal);
 
-            if let Some(r) = result.lock().unwrap().take() {
+            let taken = result.lock().unwrap().take();
+            if let Some(r) = taken {
                 self.default_output_index = Some(r.index);
 
                 self.sessions.push(Box::new(LinuxDeviceSession::new(
@@ -206,7 +216,7 @@ impl AudioController {
             let result: Arc<Mutex<Option<SourceResult>>> = Arc::new(Mutex::new(None));
             let result_cb = result.clone();
 
-            self.mainloop.lock();
+            let pa_guard = pa_lock(&self.mainloop);
             self.context.lock().unwrap().introspect().get_source_info_by_name(
                 "@DEFAULT_SOURCE@",
                 move |list| match list {
@@ -231,10 +241,11 @@ impl AudioController {
                     }
                 },
             );
-            self.mainloop.unlock();
+            pa_unlock(pa_guard);
             wait_for_signal(&signal);
 
-            if let Some(r) = result.lock().unwrap().take() {
+            let taken = result.lock().unwrap().take();
+            if let Some(r) = taken {
                 self.default_input_index = Some(r.index);
 
                 self.sessions.push(Box::new(LinuxDeviceSession::new(
@@ -279,7 +290,7 @@ impl AudioController {
         let signal = make_signal();
         let signal_cb = signal.clone();
 
-        self.mainloop.lock();
+        let pa_guard = pa_lock(&self.mainloop);
         self.context.lock().unwrap().introspect().get_sink_input_info_list(move |list| {
             match list {
                 ListResult::Item(sink_input) => {
@@ -318,7 +329,7 @@ impl AudioController {
                 }
             }
         });
-        self.mainloop.unlock();
+        pa_unlock(pa_guard);
         wait_for_signal(&signal);
 
         for data in collected.lock().unwrap().drain(..) {
@@ -351,7 +362,7 @@ impl AudioController {
             let signal_cb = signal.clone();
             let default_index = self.default_output_index;
 
-            self.mainloop.lock();
+            let pa_guard = pa_lock(&self.mainloop);
             self.context.lock().unwrap().introspect().get_sink_info_list(move |list| {
                 match list {
                     ListResult::Item(sink) => {
@@ -378,7 +389,7 @@ impl AudioController {
                     }
                 }
             });
-            self.mainloop.unlock();
+            pa_unlock(pa_guard);
             wait_for_signal(&signal);
 
             for data in collected.lock().unwrap().drain(..) {
@@ -411,7 +422,7 @@ impl AudioController {
             let signal_cb = signal.clone();
             let default_index = self.default_input_index;
 
-            self.mainloop.lock();
+            let pa_guard = pa_lock(&self.mainloop);
             self.context.lock().unwrap().introspect().get_source_info_list(move |list| {
                 match list {
                     ListResult::Item(source) => {
@@ -443,7 +454,7 @@ impl AudioController {
                     }
                 }
             });
-            self.mainloop.unlock();
+            pa_unlock(pa_guard);
             wait_for_signal(&signal);
 
             for data in collected.lock().unwrap().drain(..) {
@@ -497,6 +508,8 @@ impl AudioController {
 
 impl Drop for AudioController {
     fn drop(&mut self) {
-        self.mainloop.stop();
+        if let Ok(mut mainloop) = self.mainloop.lock() {
+            mainloop.stop();
+        }
     }
 }

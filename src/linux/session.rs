@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 use libpulse_binding as pulse;
 use pulse::mainloop::threaded::Mainloop;
 use pulse::context::Context;
-use pulse::volume::{ChannelVolumes, Volume};
+use pulse::volume::{ChannelVolumes, Volume, VolumeLinear};
 
 use crate::Session;
 
 fn linear_to_channel_volumes(vol: f32, channels: u8) -> ChannelVolumes {
-    let pa_vol = Volume::from_linear(vol as f64);
+    let pa_vol = Volume::from(VolumeLinear(vol as f64));
     let mut cv = ChannelVolumes::default();
-    cv.set(channels as u32, pa_vol);
+    cv.set(channels, pa_vol);
     cv
 }
 
@@ -20,7 +20,7 @@ pub struct LinuxApplicationSession {
     pub channels: u8,
     volume: Mutex<f32>,
     muted: Mutex<bool>,
-    mainloop: Arc<Mainloop>,
+    mainloop: Arc<Mutex<Mainloop>>,
     context: Arc<Mutex<Context>>,
 }
 
@@ -31,7 +31,7 @@ impl LinuxApplicationSession {
         channels: u8,
         volume: f32,
         muted: bool,
-        mainloop: Arc<Mainloop>,
+        mainloop: Arc<Mutex<Mainloop>>,
         context: Arc<Mutex<Context>>,
     ) -> Self {
         Self {
@@ -60,9 +60,13 @@ impl Session for LinuxApplicationSession {
         let cv = linear_to_channel_volumes(clamped, self.channels.max(1));
         let index = self.index;
         {
-            let ml = &self.mainloop;
+            let mut ml = self.mainloop.lock().unwrap();
             ml.lock();
-            self.context.lock().unwrap().introspect().set_sink_input_volume(index, &cv, None);
+            self.context
+                .lock()
+                .unwrap()
+                .introspect()
+                .set_sink_input_volume(index, &cv, None);
             ml.unlock();
         }
         *self.volume.lock().unwrap() = clamped;
@@ -71,9 +75,13 @@ impl Session for LinuxApplicationSession {
     fn set_mute(&self, mute: bool) {
         let index = self.index;
         {
-            let ml = &self.mainloop;
+            let mut ml = self.mainloop.lock().unwrap();
             ml.lock();
-            self.context.lock().unwrap().introspect().set_sink_input_mute(index, mute, None);
+            self.context
+                .lock()
+                .unwrap()
+                .introspect()
+                .set_sink_input_mute(index, mute, None);
             ml.unlock();
         }
         *self.muted.lock().unwrap() = mute;
@@ -95,7 +103,7 @@ pub struct LinuxDeviceSession {
     pub channels: u8,
     volume: Mutex<f32>,
     muted: Mutex<bool>,
-    mainloop: Arc<Mainloop>,
+    mainloop: Arc<Mutex<Mainloop>>,
     context: Arc<Mutex<Context>>,
 }
 
@@ -107,7 +115,7 @@ impl LinuxDeviceSession {
         channels: u8,
         volume: f32,
         muted: bool,
-        mainloop: Arc<Mainloop>,
+        mainloop: Arc<Mutex<Mainloop>>,
         context: Arc<Mutex<Context>>,
     ) -> Self {
         Self {
@@ -138,13 +146,16 @@ impl Session for LinuxDeviceSession {
         let index = self.index;
         let is_output = self.is_output;
         {
-            let ml = &self.mainloop;
+            let mut ml = self.mainloop.lock().unwrap();
             ml.lock();
-            let introspect = self.context.lock().unwrap().introspect();
-            if is_output {
-                introspect.set_sink_volume_by_index(index, &cv, None);
-            } else {
-                introspect.set_source_volume_by_index(index, &cv, None);
+            {
+                let ctx = self.context.lock().unwrap();
+                let mut introspect = ctx.introspect();
+                if is_output {
+                    introspect.set_sink_volume_by_index(index, &cv, None);
+                } else {
+                    introspect.set_source_volume_by_index(index, &cv, None);
+                }
             }
             ml.unlock();
         }
@@ -155,13 +166,16 @@ impl Session for LinuxDeviceSession {
         let index = self.index;
         let is_output = self.is_output;
         {
-            let ml = &self.mainloop;
+            let mut ml = self.mainloop.lock().unwrap();
             ml.lock();
-            let introspect = self.context.lock().unwrap().introspect();
-            if is_output {
-                introspect.set_sink_mute_by_index(index, mute, None);
-            } else {
-                introspect.set_source_mute_by_index(index, mute, None);
+            {
+                let ctx = self.context.lock().unwrap();
+                let mut introspect = ctx.introspect();
+                if is_output {
+                    introspect.set_sink_mute_by_index(index, mute, None);
+                } else {
+                    introspect.set_source_mute_by_index(index, mute, None);
+                }
             }
             ml.unlock();
         }
