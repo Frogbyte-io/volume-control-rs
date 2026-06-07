@@ -5,7 +5,7 @@ use libpulse_binding as pulse;
 use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
 use pulse::mainloop::threaded::Mainloop;
 use pulse::callbacks::ListResult;
-use pulse::volume::Volume;
+use pulse::volume::VolumeLinear;
 use pulse::proplist::properties as props;
 
 use log::error;
@@ -16,9 +16,13 @@ mod session;
 use session::{LinuxApplicationSession, LinuxDeviceSession};
 
 pub struct AudioController {
-    mainloop: Arc<Mutex<Mainloop>>,
-    context: Arc<Mutex<Context>>,
+    // Field declaration order is load-bearing: Rust drops fields top-to-bottom,
+    // and libpulse requires the context to be freed *before* the mainloop (else
+    // it aborts in `mainloop_io_free`). Sessions hold `Arc` clones of both, so
+    // they must drop first to release those clones; then context, then mainloop.
     sessions: Vec<Box<dyn Session>>,
+    context: Arc<Mutex<Context>>,
+    mainloop: Arc<Mutex<Mainloop>>,
     default_output_index: Option<u32>,
     default_input_index: Option<u32>,
 }
@@ -57,7 +61,12 @@ fn pa_unlock(mut guard: std::sync::MutexGuard<'_, Mainloop>) {
 }
 
 fn avg_volume_to_linear(cv: &pulse::volume::ChannelVolumes) -> f32 {
-    cv.avg().0 as f64 as f32 / Volume::NORMAL.0 as f32
+    // Use PulseAudio's perceptual (cubic) linear conversion so that reads are
+    // the inverse of `set_volume` (which writes `Volume::from(VolumeLinear(..))`).
+    // Reading the raw `cv.avg()/NORMAL` fraction instead would make set/get
+    // asymmetric (e.g. set 0.25 would read back ~0.63 = cbrt(0.25)).
+    let linear: VolumeLinear = cv.avg().into();
+    linear.0 as f32
 }
 
 fn get_process_name_from_proc(pid_str: &str) -> Option<String> {
@@ -508,7 +517,19 @@ impl AudioController {
 
 impl Drop for AudioController {
     fn drop(&mut self) {
+        // Release the Arc clones held by sessions so the controller becomes the
+        // sole owner of the mainloop/context before tearing them down.
+        self.sessions.clear();
+
+        // Disconnect the context (under the loop lock) and stop the loop thread.
+        // The context Arc is freed before the mainloop Arc by field-drop order,
+        // which is what libpulse requires to avoid aborting in `mainloop_io_free`.
         if let Ok(mut mainloop) = self.mainloop.lock() {
+            mainloop.lock();
+            if let Ok(mut context) = self.context.lock() {
+                context.disconnect();
+            }
+            mainloop.unlock();
             mainloop.stop();
         }
     }
